@@ -35,7 +35,7 @@ herdr plugin action list --plugin devcontainer-status
 ```
 
 The first should list `devcontainer-status` as installed and enabled; the second should show
-one action, `refresh`.
+the `refresh`, `open-zed`, `open-browser`, and `cleanup-worktree` actions.
 
 ## 4. See devcontainer status — automatically
 
@@ -63,7 +63,38 @@ You don't need to wait for an event to fire. Ask for a refresh directly:
 herdr plugin action invoke devcontainer-status.refresh
 ```
 
-and see what actually happened — every hook/action run, its exit status, and its output — with:
+To open the current pane's running Devsy workspace in Zed, run:
+
+```sh
+herdr plugin action invoke devcontainer-status.open-zed
+```
+
+The action prefers Docker when both Docker and SSH workspaces are running. It does not start a
+stopped workspace.
+
+To open the current workspace URL in a new Chrome tab, run:
+
+```sh
+herdr plugin action invoke devcontainer-status.open-browser
+```
+
+The action uses the URL that `bin/devco` saved for the running workspace. It prefers Docker
+when both Docker and SSH workspaces are running.
+
+To clean up a linked worktree and its launcher-managed resources, run:
+
+```sh
+herdr plugin action invoke devcontainer-status.cleanup-worktree
+```
+
+A system dialog asks for confirmation. The action refuses a worktree with changed tracked or
+untracked files. It closes the current Herdr workspace, stops and deletes its Devsy workspaces
+and any recorded legacy DevPod workspaces, removes their tunnels, Portless routes, and SSH source
+copies, then removes the Git worktree. It
+keeps the branch. It also deletes ignored files in the checkout. On Linux, install `zenity` or
+`kdialog` to show the confirmation dialog.
+
+See what happened — every hook/action run, its exit status, and its output — with:
 
 ```sh
 herdr plugin log list --plugin devcontainer-status
@@ -152,7 +183,25 @@ Once it's installed and a sidebar row is configured, day to day this is entirely
 - **`error: checksum mismatch for ...`** — a corrupted or tampered download. Re-run
   `herdr plugin install` (or `./build.sh` from a linked checkout); it downloads fresh.
 
-## 9. Updating or removing it
+## 9. Devsy providers
+
+The plugin can show and run agents in Docker and SSH workspaces created by this project. Start
+them with `bin/devco start docker`, `bin/devco start ssh`, or `bin/worktree <branch> <provider>`.
+These commands record the worktree-to-workspace mapping. Herdr reports the provider summary in
+the `$devsy` token. It also keeps the old `$devpod` token for existing sidebar settings.
+
+From a Herdr pane in that worktree, run:
+
+```sh
+HERDR_PANE_CWD="$PWD" HERDR_DEVSY_PROVIDER=ssh herdr-devcontainer-status exec pi
+```
+
+Use `docker` or `ssh` as the provider value. Devsy adds an SSH host alias for each workspace.
+The plugin uses that host alias to start Pi with a terminal. It also opens a reverse SSH tunnel
+for Herdr's agent-state relay. The tunnel only lasts for the agent session. It does not expose
+Herdr's control socket on the network. Add and configure the Devsy providers before you use them.
+
+## 10. Updating or removing it
 
 herdr v1 has no separate "update a plugin" command — reinstalling gets you the latest release:
 

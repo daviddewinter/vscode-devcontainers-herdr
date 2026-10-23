@@ -1,10 +1,14 @@
+mod cleanup;
 mod discover;
 mod docker;
 mod exec;
 mod forward;
+mod open_browser;
+mod open_zed;
 mod report;
 mod settings;
 mod supervise;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +25,18 @@ pub(crate) struct Status {
     container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Workspace status summary, e.g. `devsy/docker:running,devsy/ssh:stopped`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    providers: Option<String>,
 }
 
 const USAGE: &str = "\
 usage: herdr-devcontainer-status <command>
 
   refresh | hook [--all]              print this pane's devcontainer status as JSON
+  open-zed                            open this pane's running Devsy workspace in Zed
+  open-browser                        open this pane's workspace URL in Chrome
+  cleanup-worktree                    remove this clean worktree and its workspace resources
   exec [--agent <name>] <command> [args...]
                                        run a command in the container as this pane's agent
                                        (a recognised agent name in <command> claims the
@@ -47,6 +57,9 @@ fn main() {
         // workspace rather than a pane, since `workspace.focused` has no
         // single pane in view.
         Some("refresh" | "hook") => print_status(args.iter().any(|a| a == "--all")),
+        Some("open-zed") => open_zed::run(),
+        Some("open-browser") => open_browser::run(),
+        Some("cleanup-worktree") => cleanup::run(),
         Some("exec") => exec::run(&args[1..]),
         Some("bridge") => bridge(&args[1..]),
         Some("relay") => relay(&args[1..]),
@@ -215,29 +228,69 @@ fn detect(cwd: &Path) -> Status {
             project_root: None,
             container: None,
             error: None,
+            providers: None,
         };
     };
 
-    match docker::list() {
-        Ok(containers) => {
-            let matched = docker::container_for(&containers, &found.project_root);
-            Status {
-                status: match matched {
-                    Some(c) if c.is_running() => "running",
-                    Some(_) => "stopped",
-                    None => "none",
-                },
-                project_root: Some(found.project_root),
-                container: matched.map(|c| c.name.clone()),
-                error: None,
+    let mut provider_states = Vec::new();
+    let mut containers = Vec::new();
+    let mut errors = Vec::new();
+
+    let workspaces = workspace::for_root(&found.project_root);
+    let has_managed_docker = workspaces
+        .iter()
+        .any(|workspace| workspace.provider == "docker");
+    if !has_managed_docker {
+        match docker::list() {
+            Ok(containers_on_docker) => {
+                if let Some(container) =
+                    docker::container_for(&containers_on_docker, &found.project_root)
+                {
+                    let state = if container.is_running() {
+                        "running"
+                    } else {
+                        "stopped"
+                    };
+                    provider_states.push(format!("docker:{state}"));
+                    containers.push(container.name.clone());
+                }
             }
+            Err(error) => errors.push(error),
         }
-        Err(e) => Status {
-            status: "error",
-            project_root: Some(found.project_root),
-            container: None,
-            error: Some(e),
-        },
+    }
+
+    for workspace in workspaces {
+        let manager = workspace.engine.clone();
+        let provider = workspace.provider.clone();
+        let result = workspace::status(workspace);
+        provider_states.push(format!("{manager}/{provider}:{}", result.status));
+        containers.push(result.workspace.id);
+        if let Some(error) = result.error {
+            errors.push(error);
+        }
+    }
+
+    let state = if provider_states
+        .iter()
+        .any(|value| value.ends_with(":running"))
+    {
+        "running"
+    } else if provider_states
+        .iter()
+        .any(|value| value.ends_with(":stopped"))
+    {
+        "stopped"
+    } else if !errors.is_empty() {
+        "error"
+    } else {
+        "none"
+    };
+    Status {
+        status: state,
+        project_root: Some(found.project_root),
+        container: (!containers.is_empty()).then(|| containers.join(",")),
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+        providers: (!provider_states.is_empty()).then(|| provider_states.join(",")),
     }
 }
 

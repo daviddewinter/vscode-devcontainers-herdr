@@ -57,6 +57,31 @@ project doesn't need a Rust toolchain or any relation to this crate at all.
 See [`.devcontainer/README.md`](.devcontainer/README.md) if you want the internals of how
 the two ends of the relay fit together.
 
+## Devsy workspaces
+
+For this project, `bin/devco` records each worktree's workspace manager, id, and provider
+under `~/.local/state/revaesor/devco/`. The plugin reads these records and shows Docker and
+SSH workspace states. Add `$devsy` to a Herdr sidebar row to see the provider summary next to
+`$devcontainer`:
+
+```toml
+ui.sidebar.agents.rows = [["state_icon", "workspace", "tab"], ["agent", "$devcontainer", "$devsy"]]
+```
+
+The plugin also keeps the `$devpod` token for older sidebar configurations. Press Ctrl+B, then
+Shift+B to open the current worktree's URL in a new Chrome tab.
+
+To run an agent in a Devsy workspace, set `HERDR_DEVSY_PROVIDER` before calling `exec`:
+
+```sh
+HERDR_PANE_CWD="$PWD" HERDR_DEVSY_PROVIDER=ssh herdr-devcontainer-status exec pi
+```
+
+Use `docker` or `ssh` as the provider value. Devsy adds an SSH host alias for each workspace.
+The plugin uses that host alias to start Pi with a terminal. It also opens a reverse SSH tunnel
+for Herdr's agent-state relay. The tunnel only lasts for the agent session. It does not expose
+Herdr's control socket on the network. Configure the Devsy providers before you use them.
+
 ## Requirements
 
 - [Docker](https://docs.docker.com/get-started/get-docker/), running

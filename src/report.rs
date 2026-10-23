@@ -114,6 +114,14 @@ pub fn publish(status: &Status, workspace_wide: bool) {
     ) else {
         return;
     };
+    if let Some(providers) = status.providers.as_deref() {
+        cmd.args(["--token", &format!("devsy={providers}")]);
+        // Keep the old token name for existing Herdr sidebar configurations.
+        cmd.args(["--token", &format!("devpod={providers}")]);
+    } else {
+        cmd.args(["--clear-token", "devsy"]);
+        cmd.args(["--clear-token", "devpod"]);
+    }
     let _ = cmd.status();
 }
 
