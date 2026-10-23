@@ -162,6 +162,47 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     };
 
+    let workspaces = crate::workspace::for_root(&root)
+        .into_iter()
+        .filter(|workspace| workspace.engine == "devsy")
+        .collect::<Vec<_>>();
+    let requested_provider = std::env::var("HERDR_DEVSY_PROVIDER").ok();
+    let provider = match requested_provider.as_deref() {
+        Some("docker" | "ssh") => requested_provider,
+        Some(other) => {
+            eprintln!("exec: unsupported Devsy provider {other:?}; use docker or ssh");
+            return 2;
+        }
+        None if workspaces.len() == 1 => Some(workspaces[0].provider.clone()),
+        None if workspaces.len() > 1 => {
+            eprintln!("exec: this worktree has multiple Devsy providers; set HERDR_DEVSY_PROVIDER to docker or ssh");
+            return 2;
+        }
+        None => None,
+    };
+    if let Some(provider) = provider.as_deref() {
+        if crate::workspace::workspace_for(&root, provider, "devsy").is_some() {
+            let pane = std::env::var("HERDR_PANE_ID")
+                .ok()
+                .filter(|pane| !pane.is_empty());
+            return run_managed_workspace(
+                &root,
+                "devsy",
+                provider,
+                pane.as_deref(),
+                claim.as_deref(),
+                args,
+            );
+        }
+        if provider == "ssh" {
+            eprintln!(
+                "exec: no Devsy SSH-provider workspace is registered for {}",
+                root.display()
+            );
+            return 1;
+        }
+    }
+
     // Same problem build.sh has with cargo: herdr starts a pane's command without
     // an interactive shell, so PATH is whatever .zprofile left behind — and the
     // npm global bin that holds `devcontainer` is usually only added by .zshrc.
@@ -213,6 +254,277 @@ pub fn run(args: &[String]) -> i32 {
         &session_env(&pane, &socket),
         args,
     ))
+}
+
+fn run_managed_workspace(
+    root: &Path,
+    engine: &str,
+    provider: &str,
+    pane: Option<&str>,
+    claim: Option<&str>,
+    args: &[String],
+) -> i32 {
+    let Some(workspace) = crate::workspace::workspace_for(root, provider, engine) else {
+        eprintln!(
+            "exec: no {engine} {provider}-provider workspace is registered for {}",
+            root.display()
+        );
+        return 1;
+    };
+
+    if pane.is_none() {
+        return wait(workspace_interactive_command(&workspace, &shell_join(args)));
+    }
+
+    if let Some(name) = claim.as_deref() {
+        if canonical_agent(name).is_none() {
+            eprintln!("exec: unknown agent {name:?} — Herdr may ignore the name");
+        }
+    }
+    spoof_argv0(args, claim);
+    let pane = pane.expect("checked above");
+
+    report(
+        supervise::bridge()
+            .start(&|| crate::forward::tcp_answers(&settings::bridge_bind(), settings::port())),
+    );
+    let remote_bin = match ensure_workspace_relay(&workspace) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("exec: {error}");
+            return 1;
+        }
+    };
+
+    let pane_hash = stable_hash(pane) as u16;
+    let relay_port = 30000 + pane_hash % 20000;
+    let socket = format!("/home/vscode/.herdr/herdr-{pane_hash}.sock");
+    let log = format!("/home/vscode/.herdr/relay-{pane_hash}.log");
+    let remote_script = format!(
+        r#"set -u
+bin={bin}
+socket={socket}
+log={log}
+relay_port={relay_port}
+mkdir -p "$HOME/.herdr"
+rm -f "$socket"
+HERDR_RELAY_HOST=127.0.0.1 HERDR_RELAY_PORT="$relay_port" HERDR_SOCKET_PATH="$socket" "$bin" relay serve >"$log" 2>&1 &
+relay_pid=$!
+cleanup() {{ kill "$relay_pid" 2>/dev/null || true; wait "$relay_pid" 2>/dev/null || true; rm -f "$socket"; }}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+i=0
+while [ ! -S "$socket" ]; do
+  i=$((i + 1))
+  if [ "$i" -ge 30 ]; then echo "Herdr relay did not start" >&2; exit 1; fi
+  sleep 0.1
+done
+export HERDR_ENV=1
+export HERDR_PANE_ID={pane}
+export HERDR_SOCKET_PATH="$socket"
+export HERDR_RELAY_PORT="$relay_port"
+if [ -x "$HOME/.local/bin/mise" ]; then
+  "$HOME/.local/bin/mise" exec -- {command}
+else
+  {command}
+fi
+status=$?
+exit "$status"
+"#,
+        bin = shell_quote(&remote_bin),
+        socket = shell_quote(&socket),
+        log = shell_quote(&log),
+        pane = shell_quote(pane),
+        command = shell_join(args),
+    );
+
+    let mut tunnel = workspace_reverse_tunnel_command(&workspace, relay_port, settings::port());
+    tunnel
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = match tunnel.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("exec: cannot start workspace relay tunnel: {error}");
+            return 1;
+        }
+    };
+    let mut tunnel = ChildGuard(child);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    match tunnel.0.try_wait() {
+        Ok(Some(status)) => {
+            eprintln!("exec: workspace relay tunnel exited early ({status})");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("exec: cannot check workspace relay tunnel: {error}");
+            return 1;
+        }
+        Ok(None) => {}
+    }
+
+    let mut command = workspace_interactive_command(&workspace, &remote_script);
+    let status = command.status();
+    match status {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(error) => {
+            eprintln!("exec: cannot run command in workspace: {error}");
+            1
+        }
+    }
+}
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn workspace_ssh_base(workspace: &crate::workspace::Workspace) -> Command {
+    if workspace.engine == "devsy" {
+        return Command::new("ssh");
+    }
+
+    let cli = crate::workspace::cli_path(&workspace.engine)
+        .unwrap_or_else(|| PathBuf::from(&workspace.engine));
+    let mut cmd = Command::new(cli);
+    cmd.args([
+        "--provider",
+        &workspace.provider,
+        "ssh",
+        &workspace.id,
+        "--workdir",
+        "/workspaces/platform",
+    ]);
+    cmd
+}
+
+fn workspace_host_alias(workspace: &crate::workspace::Workspace) -> String {
+    format!("{}.devsy", workspace.id)
+}
+
+fn workspace_ssh_command(workspace: &crate::workspace::Workspace, command: &str) -> Command {
+    let mut cmd = workspace_ssh_base(workspace);
+    if workspace.engine == "devsy" {
+        cmd.arg(workspace_host_alias(workspace)).arg(command);
+    } else {
+        cmd.arg("--command").arg(command);
+    }
+    cmd
+}
+
+fn workspace_interactive_command(
+    workspace: &crate::workspace::Workspace,
+    command: &str,
+) -> Command {
+    let mut cmd = workspace_ssh_base(workspace);
+    if workspace.engine == "devsy" {
+        cmd.arg("-t")
+            .arg(workspace_host_alias(workspace))
+            .arg(command);
+    } else {
+        cmd.arg("--command").arg(command);
+    }
+    cmd
+}
+
+fn workspace_reverse_tunnel_command(
+    workspace: &crate::workspace::Workspace,
+    remote_port: u16,
+    local_port: u16,
+) -> Command {
+    let mapping = format!("127.0.0.1:{remote_port}:127.0.0.1:{local_port}");
+    let mut cmd = workspace_ssh_base(workspace);
+    if workspace.engine == "devsy" {
+        cmd.args(["-N", "-o", "ExitOnForwardFailure=yes", "-R"])
+            .arg(mapping)
+            .arg(workspace_host_alias(workspace));
+    } else {
+        cmd.arg("--reverse-forward-ports")
+            .arg(mapping)
+            .arg("--command")
+            .arg("tail -f /dev/null");
+    }
+    cmd
+}
+
+fn ensure_workspace_relay(workspace: &crate::workspace::Workspace) -> Result<String, String> {
+    let arch_command =
+        workspace_ssh_command(workspace, "printf 'HERDR_ARCH=%s\\n' \"$(uname -m)\"")
+            .output()
+            .map_err(|error| format!("cannot query workspace architecture: {error}"))?;
+    if !arch_command.status.success() {
+        return Err(String::from_utf8_lossy(&arch_command.stderr)
+            .trim()
+            .to_string());
+    }
+    let arch_stdout = String::from_utf8_lossy(&arch_command.stdout).into_owned();
+    let arch = arch_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HERDR_ARCH="))
+        .ok_or_else(|| "workspace did not report its CPU architecture".to_string())?;
+    let triple = musl_triple(arch)
+        .ok_or_else(|| format!("no Herdr relay binary published for workspace arch {arch}"))?;
+    let local = bundled_relay_binary(triple)?;
+    let remote = format!("/tmp/herdr-devcontainer-status-{VERSION}");
+    let probe = workspace_ssh_command(
+        workspace,
+        &format!("if [ -x {remote} ]; then {remote} --version; fi"),
+    )
+    .output()
+    .map_err(|error| format!("cannot check remote Herdr relay: {error}"))?;
+    if String::from_utf8_lossy(&probe.stdout)
+        .lines()
+        .any(|line| line.trim() == crate::version_line())
+    {
+        return Ok(remote);
+    }
+
+    let file = std::fs::File::open(&local)
+        .map_err(|error| format!("cannot open {}: {error}", local.display()))?;
+    let mut push = workspace_ssh_command(
+        workspace,
+        &format!("mkdir -p /tmp && cat > {remote} && chmod +x {remote}"),
+    );
+    push.stdin(Stdio::from(file));
+    let output = push
+        .output()
+        .map_err(|error| format!("cannot upload Herdr relay to workspace: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "uploading the Herdr relay to the workspace failed ({}){}",
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    Ok(remote)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn stable_hash(value: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 /// herdr decides *which* agent a pane is running by scanning the pane's
@@ -669,6 +981,44 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devsy_docker_and_ssh_workspaces_use_their_generated_ssh_hosts() {
+        for provider in ["docker", "ssh"] {
+            let workspace = crate::workspace::Workspace {
+                engine: "devsy".to_string(),
+                id: format!("feature-x-{provider}-devsy"),
+                provider: provider.to_string(),
+                root: PathBuf::from("/repo"),
+                portless_alias: None,
+            };
+            let command = workspace_interactive_command(&workspace, "pi");
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(command.get_program(), "ssh");
+            assert_eq!(args, ["-t", &format!("{}.devsy", workspace.id), "pi"]);
+
+            let tunnel = workspace_reverse_tunnel_command(&workspace, 38000, 47100);
+            let tunnel_args = tunnel
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(tunnel.get_program(), "ssh");
+            assert_eq!(
+                tunnel_args,
+                [
+                    "-N",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-R",
+                    "127.0.0.1:38000:127.0.0.1:47100",
+                    &format!("{}.devsy", workspace.id)
+                ]
+            );
+        }
+    }
 
     #[test]
     fn a_command_that_names_an_agent_claims_the_pane() {

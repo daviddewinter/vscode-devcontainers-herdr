@@ -2,7 +2,7 @@ id = "devcontainer-status"
 name = "Devcontainer Status"
 version = "0.7.3"
 min_herdr_version = "0.8.0"
-description = "Shows the VS Code devcontainer state of each pane's project"
+description = "Shows Docker and Devsy workspace state and tracks agents in both"
 platforms = ["macos", "linux"]
 
 [[build]]
@@ -14,6 +14,27 @@ title = "Refresh devcontainer status"
 description = "Re-detect devcontainer state for this pane (or all panes in the workspace)"
 contexts = ["pane", "workspace"]
 command = ["./bin/herdr-devcontainer-status", "refresh"]
+
+[[actions]]
+id = "open-zed"
+title = "Open devcontainer in Zed"
+description = "Open the running Devsy workspace for this pane's project in Zed"
+contexts = ["pane"]
+command = ["./bin/herdr-devcontainer-status", "open-zed"]
+
+[[actions]]
+id = "open-browser"
+title = "Open workspace in Chrome"
+description = "Open this worktree's running workspace URL in a new Chrome tab"
+contexts = ["pane"]
+command = ["./bin/herdr-devcontainer-status", "open-browser"]
+
+[[actions]]
+id = "cleanup-worktree"
+title = "Clean up this worktree"
+description = "Close this Herdr workspace and remove its clean Git worktree and workspace resources"
+contexts = ["pane"]
+command = ["./bin/herdr-devcontainer-status", "cleanup-worktree"]
 
 [[events]]
 on = "pane.created"
